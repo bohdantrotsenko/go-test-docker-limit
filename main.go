@@ -9,10 +9,35 @@ import (
 	"time"
 )
 
-const bufSize = 1 * 1024 * 1024
-const freeP = 0.499
+///////////////////////////////////////
+// work-load
 
-const softLimit = 180 * 1024 * 1024
+const perWorkItemAllocation = 1 * 1024 * 1024
+const workItemMinDuration = time.Millisecond * 20
+const workItemMaxDuration = time.Millisecond * 1200
+const workItemAppearanceInterval = time.Millisecond // 1000 times/seq * 0.5sec/req avg => 250MB avg
+
+func workItem() {
+	buffer := make([]byte, perWorkItemAllocation)
+	for i := 0; i < perWorkItemAllocation; i++ {
+		buffer[i] = 12 // this is to overcome linux's memory overcommit
+	}
+	time.Sleep(time.Duration(rand.Int63n(int64(workItemMaxDuration-workItemMinDuration)+1)) + workItemMinDuration)
+
+	// becase go 1.10 is smart enough to release the buffer if it's not access at this point
+	max := byte(0)
+	for i := 0; i < perWorkItemAllocation; i++ {
+		if max < buffer[i] {
+			max = buffer[i]
+		}
+	}
+}
+
+///////////////////////////////////////
+// GC-watcher related settings
+
+// softLimit
+const softLimit = 280 * 1024 * 1024
 
 var degradedOperationsInterval = 2 * time.Second
 var degradedOperationsFlag = int32(0)
@@ -21,6 +46,10 @@ func isDegraded() bool {
 	return atomic.LoadInt32(&degradedOperationsFlag) > 0
 }
 
+///////////////////////////////////////
+// GC-watcher 'internals'
+
+// memStatsLight is a copy of runtime.MemStats omitting some fields
 type memStatsLight struct {
 	Alloc         uint64
 	TotalAlloc    uint64
@@ -95,7 +124,7 @@ func finalizer(obj interface{}) {
 func init() {
 	gcInfo = make(chan struct{}, 1)
 	gcDegraded = make(chan struct{}, 1)
-	runtime.SetFinalizer(bytes.NewBuffer(make([]byte, 256)), finalizer)
+	runtime.SetFinalizer(bytes.NewBuffer(make([]byte, 256)), finalizer) // a trick to watch for GC
 	go func() {
 		var stat runtime.MemStats
 		var statCleaned memStatsLight
@@ -115,7 +144,9 @@ func init() {
 					log.Fatalf("err writing stat: %s", err)
 				}*/
 
-			// fmt.Printf("\n%+v\n", &statCleaned)
+			// fmt.Printf("\n%+v\n", &statCleaned) // more statistics
+
+			// fmt.Printf("NextGC: %d\n\n", statCleaned.NextGC/1024/1024) // less statistics
 			if statCleaned.NextGC > softLimit {
 				atomic.StoreInt32(&degradedOperationsFlag, 1)
 				gcDegraded <- struct{}{}
@@ -135,41 +166,33 @@ func init() {
 	}()
 }
 
+///////////////////////////////////////
+
 func main() {
-	var bufs [][]byte
+	rand.Seed(time.Now().UnixNano())
+
 	total := int64(0)
 	workDone := int64(0)
 
 	go func() {
 		for {
 			fmt.Printf("  Total: %dM (done: %d)    \n", atomic.LoadInt64(&total)/1024/1024, atomic.LoadInt64(&workDone))
-			time.Sleep(time.Second)
+			time.Sleep(time.Second / 4)
 		}
 	}()
 
-	rnd := rand.New(rand.NewSource(16))
 	for allocIdx := 0; true; allocIdx++ {
-		freeMemoryInstead := rnd.Float32() <= freeP
-
-		if freeMemoryInstead && len(bufs) > 0 {
-			whatToFree := rnd.Intn(len(bufs))
-			bufs[whatToFree] = bufs[len(bufs)-1]
-			bufs[len(bufs)-1] = nil
-			bufs = bufs[:len(bufs)-1]
-			atomic.AddInt64(&total, -bufSize)
-			continue
-		}
+		time.Sleep(workItemAppearanceInterval)
 
 		if isDegraded() {
 			continue
 		}
 
-		buffer := make([]byte, bufSize)
-		for i := 0; i < bufSize; i++ {
-			buffer[i] = 12
-		}
-		bufs = append(bufs, buffer)
-		atomic.AddInt64(&total, bufSize)
-		atomic.AddInt64(&workDone, 1)
+		atomic.AddInt64(&total, perWorkItemAllocation)
+		go func() {
+			workItem()
+			atomic.AddInt64(&total, -perWorkItemAllocation)
+			atomic.AddInt64(&workDone, 1)
+		}()
 	}
 }
